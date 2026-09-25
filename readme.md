@@ -1,270 +1,119 @@
-# Business Entity Resolution — Step-by-Step Diagram & Team Execution Plan
+# Business Entity Resolution
+
+**Reality check first:** the full architecture in `ARCHITECTURE.md` is the _ideal_ system. In 72 hours with 3 people, you cannot build all of it well — trying to will leave you with nothing that runs. This plan tells you exactly what to cut, what to protect, and in what order, so you always have a submittable, valid output on hand.
 
 ---
 
-## PART 1 — CLEAR STEP-BY-STEP ARCHITECTURE DIAGRAM
+## 0. Prioritization — what's Must / Should / Cut
 
-Each box = one concrete step. Each arrow = a saved artifact handed to the next step.
-🚦 = mandatory gate — **do not proceed past a 🚦 until it passes.**
+| Tier                                                | Components                                                                                                                                                                                                                                                                    | Why                                                                                                                                                                                           |
+| --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **MUST (protect at all costs)**                     | Data contract + validation, leakage-safe split, basic normalization, 2–3 retrieval channels (exact + token + one fuzzy/embedding), candidate recall check, pairwise features, LightGBM matcher, 0/1/many decision engine, threshold tuning, output generation, validator PASS | Without these you have no scoreable submission. This is the entire critical path.                                                                                                             |
+| **SHOULD (add if on schedule)**                     | Phonetic + address retrieval channels, embedding ANN retrieval, hard negative mining, calibration, groupby-argmax global consistency, France-specific check, basic error analysis                                                                                             | These are what separate a decent F0.5 from a good one, and what make the methodology doc credible.                                                                                            |
+| **CUT unless significant time remains at hour 60+** | MinHash LSH, Sorted Neighborhood, selective local LLM, full A0–A12 ablation suite, SHAP, extensive error-bucket taxonomy                                                                                                                                                      | Real, measurable value, but not worth the risk of missing the MUST tier. Mention them in the doc as "identified but deferred due to time constraints" — this is honest and still shows depth. |
+
+**Golden rule for 72 hours: get a complete, valid, mediocre submission by hour 24. Improve it after that. Never let "make it good" block "make it exist."**
+
+---
+
+## 1. Team of 3 — Role Split
+
+| Role                          | Owns                                                                                                                        | Focus                                                                    |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| **A — Data & Retrieval**      | Data contract, split, normalization, all retrieval channels, candidate recall gate, freeze                                  | Gets a valid, high-recall candidate set to B as fast as possible         |
+| **B — Modeling**              | Feature engine, LightGBM, calibration, hard negatives                                                                       | Turns candidates into scored pairs                                       |
+| **C — Decision, Eval & Docs** | Metric implementation, decision engine, threshold tuning, global consistency, output generation, validator, methodology doc | Turns scores into a valid submission, and writes the story as it happens |
+
+With 3 people, everyone touches the pipeline sequentially at some point — the split above is about **primary ownership**, not isolation. Pair up at the two hard handoff points (see below).
+
+---
+
+## 2. Condensed Step Diagram (72hr-scoped)
 
 ```
-STEP 0 ─────────────────────────────────────────────────────────────
-  INSPECT REPO + DATASET
-  IN:  raw dataset/train, dataset/test
-  DO:  confirm file counts, column schema, row counts match EDA doc
-  OUT: confirmed data contract
-──────────────────────────────────────────────────────────────────
-
-STEP 1 ─────────────────────────────────────────────────────────────
-  DATA CONTRACT + VALIDATION
-  IN:  raw TSVs
-  DO:  schema check, ID prefix check, dedup check, missingness report,
-       ground-truth referential check (do GT IDs exist in S2/S3?)
-  OUT: src/data/loader.py, schema.py, validation.py + passing tests
-──────────────────────────────────────────────────────────────────
-
-STEP 2 ─────────────────────────────────────────────────────────────
-  LEAKAGE-SAFE TRAIN / VALIDATION SPLIT
-  IN:  train_source1.tsv, train_ground_truth.tsv
-  DO:  split at S1 entity level, fixed seed, no S1 entity in both sides
-  OUT: train_split.parquet, val_split.parquet (S1 ID lists only)
-──────────────────────────────────────────────────────────────────
-
-STEP 3 ─────────────────────────────────────────────────────────────
-  MULTI-VIEW NORMALIZATION
-  IN:  raw S1/S2/S3 records
-  DO:  build raw / normalized / transliterated / tokens / char n-grams /
-       phonetic / structured-address views for name + address
-  OUT: normalized_s1.parquet, normalized_s2.parquet, normalized_s3.parquet
-       (original columns preserved alongside new ones)
-──────────────────────────────────────────────────────────────────
-
-STEP 4 ─────────────────────────────────────────────────────────────
-  DYNAMIC COUNTRY SHARDING
-  IN:  normalized records
-  DO:  partition by country value (no hardcoded list) — India / US /
-       France / any future country auto-handled
-  OUT: per-country record shards, each processed independently downstream
-──────────────────────────────────────────────────────────────────
-
-STEP 5 ─────────────────────────────────────────────────────────────
-  RETRIEVAL CHANNEL 1 → 7 (run per country shard)
-  5a. Exact-name inverted index
-  5b. Token inverted index (common-token capped)
-  5c. Character n-gram / sparse TF-IDF retrieval
-  5d. Phonetic (Double Metaphone) index
-  5e. MinHash LSH near-duplicate blocking
-  5f. Sorted Neighborhood (sort key + sliding window)
-  5g. Address retrieval (postal / street-number / locality)
-  OUT: per-channel candidate lists + provenance flag per channel
-──────────────────────────────────────────────────────────────────
-
-STEP 6 ─────────────────────────────────────────────────────────────
-  CANDIDATE UNION + DEDUP
-  IN:  outputs of Steps 5a–5g
-  DO:  union all channels, dedup IDs, store which channel(s) hit,
-       store channel-count per pair
-  OUT: candidates_lexical.parquet
-──────────────────────────────────────────────────────────────────
-
-🚦 STEP 7 ─────────────────────────────────────────────────────────
-  CANDIDATE RECALL GATE #1 (lexical only)
-  DO:  compare candidates_lexical vs ground truth on val split
-  PASS IF: recall meets target (define target, e.g. ≥97%) across
-       country / 0-1-many / easy-medium-hard breakdowns
-  IF FAIL → go back to Step 5, add/tune channels. DO NOT CONTINUE.
-──────────────────────────────────────────────────────────────────
-
-STEP 8 ─────────────────────────────────────────────────────────────
-  MULTILINGUAL EMBEDDING RETRIEVAL
-  IN:  normalized records (Step 3)
-  DO:  embed name / address / combined, build FAISS IVF-PQ index
-       (quantized, not flat), retrieve top-K per query
-  OUT: candidates_embedding.parquet
-──────────────────────────────────────────────────────────────────
-
-🚦 STEP 9 ─────────────────────────────────────────────────────────
-  CANDIDATE RECALL GATE #2 (lexical + embedding)
-  DO:  union Step 6 + Step 8, re-measure recall
-  PASS IF: recall improves to target and P95 candidate count stays
-       within compute budget
-  IF FAIL → tune embedding K / index / add channels. DO NOT CONTINUE.
-──────────────────────────────────────────────────────────────────
-
-STEP 10 ────────────────────────────────────────────────────────────
-  FREEZE CANDIDATE GENERATION
-  DO:  lock the exact config (channels, params, K) that passed Step 9
-  OUT: candidate_pairs.tsv generation code is now FROZEN — never
-       changed again, only re-run identically for test
-──────────────────────────────────────────────────────────────────
-
-STEP 11 ────────────────────────────────────────────────────────────
-  CASCADE FEATURE ENGINE — L1 (cheap)
-  IN:  frozen candidate pairs
-  DO:  exact/normalized match flags, token overlap, channel count
-  OUT: pruned candidate set (drop obvious non-matches)
-──────────────────────────────────────────────────────────────────
-
-STEP 12 ────────────────────────────────────────────────────────────
-  CASCADE FEATURE ENGINE — L2 (expensive, survivors only)
-  DO:  edit distance, Jaro-Winkler, phonetic agreement, embedding
-       cosine, address component overlap, structural features
-  OUT: features.parquet (one row per surviving candidate pair)
-──────────────────────────────────────────────────────────────────
-
-STEP 13 ────────────────────────────────────────────────────────────
-  LOGISTIC REGRESSION BASELINE
-  IN:  features.parquet (train split)
-  DO:  train, evaluate Macro F0.5 on val — sanity-checks features/labels
-  OUT: baseline_model.pkl, baseline metrics report
-──────────────────────────────────────────────────────────────────
-
-STEP 14 ────────────────────────────────────────────────────────────
-  HARD NEGATIVE MINING
-  IN:  train-split candidates + labels
-  DO:  mine near-miss non-matches (same name/address/country but not
-       a true match), respecting train/val boundary
-  OUT: augmented training set with hard negatives
-──────────────────────────────────────────────────────────────────
-
-STEP 15 ────────────────────────────────────────────────────────────
-  LIGHTGBM MATCHER
-  IN:  augmented training features
-  DO:  train, compare vs. LR baseline on val Macro F0.5
-  OUT: lightgbm_model.pkl (keep only if it beats baseline)
-──────────────────────────────────────────────────────────────────
-
-STEP 16 ────────────────────────────────────────────────────────────
-  PROBABILITY CALIBRATION
-  DO:  fit Platt + isotonic on train, compare calibration curves on val
-  OUT: calibrated_model.pkl
-──────────────────────────────────────────────────────────────────
-
-STEP 17 ────────────────────────────────────────────────────────────
-  ENTITY-LEVEL 0/1/MANY DECISION ENGINE
-  IN:  calibrated probabilities per candidate, grouped by S1
-  DO:  sort per S1, apply threshold + margin + evidence-strength rules,
-       explicitly branch: no-candidate / weak / one-strong / multi-strong
-  OUT: decision_engine.py
-──────────────────────────────────────────────────────────────────
-
-STEP 18 ────────────────────────────────────────────────────────────
-  F0.5 THRESHOLD / MARGIN OPTIMIZATION
-  IN:  decision engine + val set
-  DO:  grid/Optuna search over threshold + margin, optimize Macro F0.5
-  OUT: final_thresholds.yaml
-──────────────────────────────────────────────────────────────────
-
-STEP 19 ────────────────────────────────────────────────────────────
-  GLOBAL CONSISTENCY (groupby-argmax) — VALIDATION-GATED
-  DO:  for candidate IDs claimed by >1 S1, keep only top-scoring
-       assignment above threshold; measure Macro F0.5 with vs. without
-  OUT: keep ONLY if it improves val Macro F0.5
-──────────────────────────────────────────────────────────────────
-
-STEP 20 ────────────────────────────────────────────────────────────
-  SELECTIVE LOCAL LLM — VALIDATION-GATED, BUDGET-CAPPED
-  DO:  identify decision-changing ambiguous S1 entities only, cap total
-       LLM calls (e.g. ≤50K), run local Qwen2.5-7B/Phi-3-mini, measure
-       Macro F0.5 with vs. without
-  OUT: keep ONLY if it improves val Macro F0.5, else remove entirely
-──────────────────────────────────────────────────────────────────
-
-STEP 21 ────────────────────────────────────────────────────────────
-  FRANCE / UNSEEN-COUNTRY ROBUSTNESS EVAL
-  DO:  score India / US / France separately on val (simulate via
-       held-out-country test), report gaps, patch normalization/
-       retrieval if France underperforms
-  OUT: docs/error_analysis.md (country section)
-──────────────────────────────────────────────────────────────────
-
-STEP 22 ────────────────────────────────────────────────────────────
-  ERROR ANALYSIS + ABLATION + SHAP
-  DO:  bucket failures, run A0→A12 ablation table, generate SHAP on
-       final matcher
-  OUT: docs/experiments.md, docs/error_analysis.md
-──────────────────────────────────────────────────────────────────
-
-STEP 23 ────────────────────────────────────────────────────────────
-  FULL TEST INFERENCE (frozen pipeline, no ground truth touched)
-  IN:  dataset/test/*
-  DO:  run Steps 3→20 exactly as frozen, over full test set
-  OUT: raw predictions
-──────────────────────────────────────────────────────────────────
-
-STEP 24 ────────────────────────────────────────────────────────────
-  GENERATE OUTPUT FILES
-  OUT: output/matching_results.tsv, output/candidate_pairs.tsv
-──────────────────────────────────────────────────────────────────
-
-🚦 STEP 25 ─────────────────────────────────────────────────────────
-  VALIDATE + ASSERT
-  DO:  run utils/validate_submission.py → must PASS
-       assert FINAL_MATCHES ⊆ CANDIDATES
-  IF FAIL → fix output generation. DO NOT SUBMIT.
-──────────────────────────────────────────────────────────────────
-
-STEP 26 ────────────────────────────────────────────────────────────
-  DOCUMENTATION + SUBMISSION ZIP
-  OUT: README.md, methodology.md, experiments.md, error_analysis.md,
-       <team_name>_submission.zip
-──────────────────────────────────────────────────────────────────
+[A] Data contract + validation ─┐
+[A] Leakage-safe S1 split       ├─► hour 0–8
+[A] Basic normalization (name+address, no phonetic yet)
+              │
+              v
+[A] Retrieval: exact + token + character/fuzzy ─┐
+[A] (if time) + embedding ANN (small model)      ├─► hour 8–20
+              │
+              v
+   🚦 CANDIDATE RECALL CHECK (on val split)  ◄── hour ~20, WHOLE TEAM REVIEWS
+   (target: recall good enough that misses aren't the bottleneck —
+    don't chase perfection here, move on once "good enough")
+              │
+              v
+[A→B handoff] FREEZE candidate generation ─────► hour ~22
+              │
+              v
+[B] Pairwise features (name/address lexical + structural;
+    embedding cosine only if retrieval used embeddings)     ─► hour 22–32
+[B] Logistic regression baseline (quick sanity check)
+[B] LightGBM matcher
+[B] (if time) hard negatives + calibration
+              │
+              v
+[B→C handoff] Scored candidate pairs ──────────► hour ~36
+              │
+              v
+[C] Macro F0.5 metric (built earlier, in parallel — see below)
+[C] 0/1/many decision engine + threshold tuning on val        ─► hour 36–48
+[C] (if time) groupby-argmax global consistency check
+              │
+              v
+   🚦 VALIDATION MACRO F0.5 LOCKED  ◄── hour ~48, WHOLE TEAM REVIEWS
+              │
+              v
+[A+B+C] Run frozen pipeline on FULL test set                  ─► hour 48–58
+[C] Generate matching_results.tsv + candidate_pairs.tsv
+[C] Run utils/validate_submission.py → 🚦 MUST PASS            ─► hour ~58
+              │
+              v
+[ALL] Buffer for bugs found during test-scale run              ─► hour 58–66
+[C] Finish methodology.md, README, requirements.txt
+[A] Package submission ZIP                                     ─► hour 66–72
+              │
+              v
+          SUBMIT (with margin — do not submit at hour 71:59)
 ```
 
 ---
 
-## PART 2 — TEAM EXECUTION PLAN
+## 3. Hour-by-Hour Timeline
 
-### Suggested team structure (4–5 people)
+_(Assumes a team that sleeps in shifts, not a straight 72-hour grind — build in rest or you will make costly mistakes at hour 50.)_
 
-| Role                                                               | Owns pipeline steps    | Primary skills                                        |
-| ------------------------------------------------------------------ | ---------------------- | ----------------------------------------------------- |
-| **A. Data & Infra Lead**                                           | 0, 1, 2, 4, 10, 25, 26 | data engineering, validation, packaging, repo hygiene |
-| **B. Retrieval Engineer**                                          | 3, 5a–5g, 6, 7, 8, 9   | search/blocking, FAISS, LSH, scalability              |
-| **C. ML Modeling Engineer**                                        | 11, 12, 13, 14, 15, 16 | feature engineering, LightGBM, calibration            |
-| **D. Decision & Evaluation Lead**                                  | 17, 18, 19, 21, 22     | metrics, threshold tuning, error analysis, ablations  |
-| **E. LLM & Docs Lead** (can double with A or D on a 4-person team) | 20, 23, 24, 26         | local LLM serving, prompt design, methodology writing |
+| Hours     | A (Data & Retrieval)                                                                                                      | B (Modeling)                                                                       | C (Decision, Eval & Docs)                                                                               |
+| --------- | ------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| **0–4**   | Inspect repo/data, build data contract + validation + tests                                                               | Set up env, dependencies, LightGBM/sklearn sanity install                          | Implement Macro F0.5 metric function + unit test it against the worked example in the problem statement |
+| **4–8**   | Leakage-safe S1 split; start normalization (name first)                                                                   | Draft feature-engine skeleton against synthetic/dummy candidate pairs              | Draft decision-engine skeleton (thresholding logic) against synthetic scores                            |
+| **8–14**  | Finish normalization (address); build exact + token retrieval                                                             | Continue feature engine (structural + lexical features), ready to run on real data | Build output-file writer + wrap `utils/validate_submission.py` into a quick local check script          |
+| **14–20** | Build character/fuzzy retrieval channel; (stretch) small embedding ANN channel; union candidates                          | Idle/pairing with A to unblock retrieval, or start writing feature unit tests      | Start `docs/eda_report.md` and methodology skeleton with real EDA numbers                               |
+| **~20**   | 🚦 **Candidate recall check on val split — all 3 review together**                                                        |                                                                                    |                                                                                                         |
+| **20–22** | Freeze candidate generation config                                                                                        | —                                                                                  | —                                                                                                       |
+| **22–28** | Support B if retrieval bugs surface; otherwise start France-specific normalization check                                  | Run real feature engine on frozen candidates; train LR baseline                    | Finalize decision-engine logic (0/1/many branches), write tests                                         |
+| **28–36** | Idle/QA pass on retrieval code; write retrieval unit tests                                                                | Train LightGBM, compare vs. baseline; add calibration if time allows               | Wire decision engine to real (small/dev-scale) scored output; smoke-test end-to-end on val split        |
+| **36–42** | —                                                                                                                         | Hand off scored candidates to C; support threshold tuning if needed                | Run threshold/margin optimization for Macro F0.5 on val                                                 |
+| **42–48** | (stretch) groupby-argmax global consistency, if B/C have bandwidth to support                                             | (stretch) hard-negative mining pass if ahead of schedule                           | Evaluate global consistency impact; lock final decision config                                          |
+| **~48**   | 🚦 **Validation Macro F0.5 locked — all 3 review together, decide what's in/out of final pipeline**                       |                                                                                    |                                                                                                         |
+| **48–54** | Run frozen normalization + retrieval on full test set (this will take real wall-clock time — start early, monitor memory) | Run feature engine + matcher on full test candidates as A's output streams in      | Prep output-generation script for full-scale run                                                        |
+| **54–58** | Support/debug full-scale run (this is where scale bugs appear — buffer time is critical)                                  | Same                                                                               | Generate `matching_results.tsv` + `candidate_pairs.tsv`; run validator                                  |
+| **58–62** | Fix any validator failures found                                                                                          | Fix any validator failures found                                                   | Fix any validator failures found — **all hands if validator fails**                                     |
+| **62–66** | Write README + reproducibility instructions for retrieval module                                                          | Write methodology sections for features/modeling                                   | Finish methodology.md, error analysis (lightweight), experiments summary                                |
+| **66–70** | Assemble submission ZIP structure                                                                                         | Final code cleanup, pin `requirements.txt`                                         | Final doc pass, proofread                                                                               |
+| **70–72** | **Buffer / submit**                                                                                                       | **Buffer / submit**                                                                | **Buffer / submit**                                                                                     |
 
-If only 4 people: merge **E into D** (Decision/Eval lead also owns the selective LLM, since it plugs directly into the decision engine) and have **A** own final inference + packaging with help from whoever is free.
+---
 
-### Critical path (cannot be parallelized — hard dependencies)
+## 4. Hard Rules for a 72-Hour Sprint
 
-```
-Step 1 → Step 2 → Step 3 → Step 4 → Steps 5–9 (🚦 gates) → Step 10 (FREEZE)
-   → Step 11–12 → Step 13 → Step 15 → Step 16 → Step 17 → Step 18
-   → Step 19 → Step 20 → Step 23 → Step 24 → 🚦 Step 25 → Step 26
-```
-
-Everything downstream of Step 10 depends on the frozen candidate set. Everything downstream of Step 16 depends on the calibrated model. **These two freezes are your synchronization points — plan team check-ins around them, not around calendar days.**
-
-### What CAN run in parallel
-
-- **Steps 1–2** (Data/Infra) run alongside early **Step 3 prototyping** (Retrieval) on a small sample, since normalization logic can be drafted before the split is finalized.
-- **Steps 5a–5g** (the seven retrieval channels) are largely independent of each other — split across 2 people if available (e.g., B1 does exact/token/character, B2 does phonetic/LSH/SNM/address), then merge at Step 6.
-- While Retrieval is working through Steps 5–9, **ML Modeling (C)** can build and unit-test the feature engine (Step 11–12) and LightGBM training code (Step 15) against a _toy/sample candidate set_, so it's ready to run for real the moment Step 10 freezes.
-- **Decision & Eval (D)** can build the Macro F0.5 metric implementation and the decision-engine skeleton (Step 17–18) early, independent of retrieval/matching progress, and test it with synthetic scores.
-- **Docs (E/A)** can draft `docs/eda_report.md` and the methodology template skeleton from day one, filling in numbers as each stage completes, rather than writing everything at the end.
-- Ablations (Step 22) can be run incrementally as each component lands, rather than as one block at the end.
-
-### Suggested timeline (example: 6-day sprint — adjust to your actual deadline)
-
-| Day       | Focus                                                                                                                    | Milestone                                                                      |
-| --------- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
-| **Day 1** | Steps 0–4: data contract, split, normalization, country sharding                                                         | Normalized, sharded data ready for all downstream work                         |
-| **Day 2** | Steps 5–7: build all lexical retrieval channels, union, Gate #1                                                          | 🚦 Lexical candidate recall gate passes                                        |
-| **Day 3** | Steps 8–10: embedding retrieval, Gate #2, freeze candidates                                                              | 🚦 Candidate generation frozen — **hard sync point, whole team reviews**       |
-| **Day 4** | Steps 11–16: features, baseline, hard negatives, LightGBM, calibration                                                   | Calibrated matcher beats baseline on val Macro F0.5                            |
-| **Day 5** | Steps 17–22: decision engine, threshold tuning, global consistency, selective LLM, France eval, error analysis/ablations | Final validation Macro F0.5 locked in; methodology draft complete              |
-| **Day 6** | Steps 23–26: full test inference, output generation, validator, docs, ZIP                                                | 🚦 Validator PASS, submission ready with time to spare for a leaderboard check |
-
-Build in slack: submit a rough end-to-end run (even with weak components) by end of **Day 3**, so you have a working submission before you start optimizing. This protects you from a broken pipeline the night before the deadline.
-
-### Team workflow rules
-
-1. **One shared repo, feature branches per pipeline stage**, PR review before merging into `main` — especially around the two freeze points (candidate generation, calibrated model), since everyone downstream depends on them being stable.
-2. **Config-driven handoffs**: nobody hardcodes parameters in their module — every tunable value lives in the relevant `configs/*.yaml`, so another teammate can adjust it without touching code.
-3. **Daily 15-minute sync** focused on exactly three questions: _what's blocking me, what did my last gate/metric show, what do I need from someone else's output._
-4. **No one touches test data until Step 23.** All development, tuning, and debugging happens against train/validation only — enforce this as a hard team rule, not just a design note.
-5. **Whoever hits a 🚦 gate posts the numbers to the team** (recall %, Macro F0.5, breakdown by country/difficulty) before anyone proceeds — gates are team checkpoints, not solo sign-offs.
-6. **Methodology doc is written incrementally**, one section per completed stage, by whoever owns that stage — not reconstructed from memory at the end.
-7. **If a component doesn't beat its baseline on validation Macro F0.5, cut it** — no one keeps a personally-built component "because it took effort." Decisions are validation-driven, not sentiment-driven.
+1. **Subsample aggressively while developing.** Don't run anything against the full multi-million-row dataset until the hour-48+ full test run. Use a 20–50K row sample (stratified by country and match-count) for all iteration — this alone is the difference between 10 iterations and 1.
+2. **Two hard sync points, not daily standups.** At 72 hours you don't have time for ceremony — sync hard at the candidate-freeze (~hour 20) and the Macro-F0.5-lock (~hour 48), and otherwise communicate asynchronously (shared doc/channel) so nobody blocks on a meeting.
+3. **Have a valid submission by hour 24, even if it's just exact+token retrieval and a logistic regression matcher.** A mediocre, valid, on-time submission beats a sophisticated one that isn't finished. Improve iteratively from there.
+4. **Whoever finishes their block early pairs with whoever's behind — don't let one person's slip become the team's slip.** With only 3 people there's no slack for silos.
+5. **Freeze points are real freezes.** Once candidates are frozen (~hour 22), Retrieval (A) does not keep tweaking it "just a little more" — that invalidates B and C's work in progress. Same for the Macro F0.5 lock.
+6. **Budget real wall-clock time for the full-scale test run** (hour 48–58) — at millions of rows, even an efficient pipeline can take hours per stage. Start it as early as your validation numbers justify, and treat any surprise slowdown as your top priority, not a side task.
+7. **Write the methodology doc as you go**, not from hour 62. You will not remember your reasoning for a threshold choice made at hour 10 by hour 68.
+8. **What you cut, name explicitly in the doc.** A line like _"MinHash LSH and selective LLM re-ranking were identified as valuable but deferred due to the 72-hour constraint"_ reads as engineering judgment, not as a gap — reviewers notice the difference between "didn't think of it" and "chose not to, and said why."
