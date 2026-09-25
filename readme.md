@@ -1,323 +1,270 @@
-# Business Entity Resolution — Final Architecture & Execution Plan
-
-**Project:** hybrid-entity-resolution
-**Metric:** Macro F0.5 (precision-weighted, per-Source-1-entity average)
-**Scale:** Train ~2.2M S1 / 5.0M S2 / 5.3M S3 · Test ~1.7M S1 / 4.9M S2 / 5.1M S3
-**Constraint:** Offline only, no external lookups, final models MIT/Apache-2.0, ≤8B params
-**Hardware target:** MacBook Air M2, 16GB RAM, no GPU assumed
+# Business Entity Resolution — Step-by-Step Diagram & Team Execution Plan
 
 ---
 
-## 1. Core Design Principle
+## PART 1 — CLEAR STEP-BY-STEP ARCHITECTURE DIAGRAM
 
-> **Separate retrieval from matching from decision from consistency.**
-
-- **Retrieval** answers: _who could possibly be the same business?_ (optimize recall)
-- **Matching** answers: _how strong is the evidence these two records are the same entity?_ (calibrated probability)
-- **Decision** answers: _which 0, 1, or many candidates should actually be returned?_ (optimize precision under F0.5)
-- **Global consistency** answers: _are the resulting assignments mutually consistent given the data's structure?_
-- **Evaluation** answers: _did each component actually earn its place?_
-
-**Guiding rule:** if a component doesn't measurably improve validation Macro F0.5, remove it. Complexity is not the goal — recall, precision, F0.5, scalability, generalization to France, and reproducibility are.
-
----
-
-## 2. Key EDA Facts Driving Design
-
-| Fact                                                                         | Design implication                                                                                                                                                                                                  |
-| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 89% of S1 entities have multi-match (2–10 matches), only 5.4% have exactly 1 | **Never use top-1 matching.** Decision engine must natively support 0/1/many.                                                                                                                                       |
-| 100% country agreement in true matches                                       | Country is a **hard blocking key**, not just a feature — shard the entire pipeline by country.                                                                                                                      |
-| Zero S2/S3 IDs linked to >1 S1 entity in training                            | Structural invariant: **each S2/S3 record belongs to at most one real business.** Exploit this for cheap global conflict resolution — don't just "experiment" with it, expect it to help and validate that it does. |
-| France unseen in training, ~1.7M test records                                | Normalization, embeddings, and retrieval must generalize with **zero France-specific tuning**; explicit held-out-country stress test required before trusting the leaderboard result.                               |
-| 20.9% of matches are "hard" (low token overlap)                              | Retrieval must include phonetic + embedding channels, not just lexical.                                                                                                                                             |
-| Exact name match only in 4.6% of true positives                              | Exact/normalized matching alone is provably insufficient — multi-signal evidence is mandatory.                                                                                                                      |
-| All-pairs = ~10M × ~10M comparisons                                          | Infeasible. Retrieval must be sub-quadratic; naive Hungarian assignment (O(n³)) for global consistency is **also infeasible** — replaced with a vectorized groupby-argmax approach.                                 |
-
----
-
-## 3. Final Architecture
+Each box = one concrete step. Each arrow = a saved artifact handed to the next step.
+🚦 = mandatory gate — **do not proceed past a 🚦 until it passes.**
 
 ```
-                              INPUT DATA (S1, S2, S3, per split)
-                                        |
-                                        v
-                      DATA CONTRACT + VALIDATION (schema, IDs, missingness)
-                                        |
-                                        v
-                LEAKAGE-SAFE S1-LEVEL TRAIN / VALIDATION SPLIT (fixed seed)
-                                        |
-                                        v
-                          MULTI-VIEW NORMALIZATION
-        raw | normalized | transliterated | tokens | char n-grams | phonetic | structured address
-                                        |
-                                        v
-                    DYNAMIC COUNTRY SHARDING (India / US / France / future)
-                    (bounds memory: pipeline processes one country shard at a time)
-                                        |
-                                        v
-              ┌─────────────────────────────────────────────────────────┐
-              │        MULTI-CHANNEL CANDIDATE RETRIEVAL (per shard)      │
-              │  1. Exact name (inverted index on normalized name)         │
-              │  2. Token retrieval (inverted index, common-token capped)  │
-              │  3. Character retrieval (char n-gram / sparse TF-IDF)      │
-              │  4. Phonetic retrieval (Double Metaphone index)            │
-              │  5. MinHash LSH (near-duplicate shingle blocking)          │
-              │  6. Sorted Neighborhood (sort key + sliding window)        │
-              │  7. Address retrieval (postal / street-number / locality)  │
-              │  8. Multilingual embedding ANN (FAISS IVF-PQ, quantized)   │
-              └───────────────────────┬─────────────────────────────────┘
-                                        v
-                    CANDIDATE UNION + DEDUP + RETRIEVAL PROVENANCE
-                (store which channel(s) retrieved each pair — becomes a feature)
-                                        |
-                                        v
-                    ★ CANDIDATE RECALL QUALITY GATE ★ (mandatory checkpoint)
-              recall vs ground truth, broken down by country / 0-1-many / difficulty
-                    insufficient → STOP, improve retrieval, do not proceed
-                                        |
-                                        v (sufficient)
-                    FREEZE CANDIDATE GENERATION CONFIG
-              (candidate_pairs.tsv = this exact frozen set, forever)
-                                        |
-                                        v
-              ┌─────────────────────────────────────────────────────────┐
-              │         CASCADE PAIRWISE FEATURE ENGINE                   │
-              │  L1 (cheap, vectorized): exact/normalized flags,           │
-              │     token overlap, retrieval-channel count                │
-              │     → prune obvious non-matches before L2                 │
-              │  L2 (expensive, survivors only): edit distance,            │
-              │     Jaro-Winkler, phonetic agreement, embedding cosine,    │
-              │     address component overlap, structural features        │
-              └───────────────────────┬─────────────────────────────────┘
-                                        v
-                        LOGISTIC REGRESSION BASELINE
-                (sanity-checks features/labels, catches leakage early)
-                                        |
-                                        v
-                          HARD NEGATIVE MINING
-        (same-name/same-address/high-similarity non-matches, train-split only)
-                                        |
-                                        v
-                          LIGHTGBM MATCHER
-                    (compared against LR baseline on Macro F0.5)
-                                        |
-                                        v
-                    PROBABILITY CALIBRATION (Platt / isotonic)
-                        (fit on train split only)
-                                        |
-                                        v
-              ┌─────────────────────────────────────────────────────────┐
-              │           ENTITY-LEVEL 0 / 1 / MANY DECISION ENGINE        │
-              │  per S1: sort candidate probabilities, apply              │
-              │  absolute threshold + top/next margin + evidence          │
-              │  strength + candidate-count distribution                  │
-              │  → explicit handling of: no candidates, weak candidates,   │
-              │    one strong, multiple strong, ambiguous                 │
-              └───────────────────────┬─────────────────────────────────┘
-                                        v
-                      F0.5 THRESHOLD / MARGIN OPTIMIZATION
-                    (tuned on validation only, documented, not arbitrary)
-                                        |
-                                        v
-              ┌─────────────────────────────────────────────────────────┐
-              │         GLOBAL CONSISTENCY (groupby-argmax)                │
-              │  Exploits the "≤1 owning S1 per S2/S3 record" invariant:   │
-              │  for each candidate ID claimed by multiple S1 entities,    │
-              │  keep only the highest-scoring assignment above threshold. │
-              │  O(n log n) vectorized groupby — NOT Hungarian assignment  │
-              │  (infeasible at this scale). Validation-gated.             │
-              │  Never forces one-to-one on the S1 side — one S1 can       │
-              │  still own many S2/S3 records.                             │
-              └───────────────────────┬─────────────────────────────────┘
-                                        v
-                    ┌───────────────────────────────┐
-                    │  HIGH-CONFIDENCE → direct decision │
-                    │  AMBIGUOUS (thin top/next margin,  │
-                    │  both candidates otherwise strong, │
-                    │  decision-changing) → SELECTIVE     │
-                    │  LOCAL LLM, hard call-budget capped │
-                    │  (e.g. ≤50K calls on full test set) │
-                    └───────────────────┬───────────────┘
-                                        v
-                                    EVALUATION
-        Macro F0.5 · candidate recall · 0/1/many breakdown · India/US/France ·
-        ablations · error analysis · SHAP · runtime · memory
-                                        |
-                                        v
-                                FINAL OUTPUTS
-                    matching_results.tsv  +  candidate_pairs.tsv
-                    (assert FINAL_MATCHES ⊆ CANDIDATES)
-```
+STEP 0 ─────────────────────────────────────────────────────────────
+  INSPECT REPO + DATASET
+  IN:  raw dataset/train, dataset/test
+  DO:  confirm file counts, column schema, row counts match EDA doc
+  OUT: confirmed data contract
+──────────────────────────────────────────────────────────────────
 
----
+STEP 1 ─────────────────────────────────────────────────────────────
+  DATA CONTRACT + VALIDATION
+  IN:  raw TSVs
+  DO:  schema check, ID prefix check, dedup check, missingness report,
+       ground-truth referential check (do GT IDs exist in S2/S3?)
+  OUT: src/data/loader.py, schema.py, validation.py + passing tests
+──────────────────────────────────────────────────────────────────
 
-## 4. Why This Is a Standout Solution (not a generic ER demo)
+STEP 2 ─────────────────────────────────────────────────────────────
+  LEAKAGE-SAFE TRAIN / VALIDATION SPLIT
+  IN:  train_source1.tsv, train_ground_truth.tsv
+  DO:  split at S1 entity level, fixed seed, no S1 entity in both sides
+  OUT: train_split.parquet, val_split.parquet (S1 ID lists only)
+──────────────────────────────────────────────────────────────────
 
-1. **Exploits a discovered structural invariant** (single-owner S2/S3 records) with a _cheap, scalable_ mechanism (groupby-argmax) instead of either ignoring it or reaching for an infeasible optimal-assignment algorithm. This is evidence-driven engineering, not a textbook default.
-2. **Country sharding as a first-class architectural decision**, justified by the 100%-country-agreement EDA finding — turns an unbounded-memory problem into N bounded ones, and doubles as the retrieval blocking strategy.
-3. **Cascade (L1/L2) feature computation** — avoids paying for expensive similarity computation (embeddings, edit distance) on the ~99% of candidate pairs that a cheap flag already rules out. This is standard practice in large-scale ranking systems and is rarely done properly in challenge submissions.
-4. **Retrieval channel diversity matched to the actual noise taxonomy found in EDA** (typos → character/phonetic; transliteration → multilingual embeddings; near-duplicates → MinHash LSH; ordering → Sorted Neighborhood) rather than generic "embeddings + fuzzy match."
-5. **LLM used surgically, under an explicit compute budget, gated on decision-impact** (not just score-ambiguity) — and removed entirely if it doesn't move validation Macro F0.5. This shows judgment rather than GenAI-for-its-own-sake.
-6. **Explicit unseen-country (France) stress test** built into the validation protocol, not just "handled by not hardcoding" — tests generalization, which is exactly what the hidden test set is designed to probe.
-7. **Every claim is validation-gated**: candidate recall gate, calibration check, threshold tuning, global consistency, and LLM usage all require measured improvement before being kept. This produces an honest, defensible methodology document rather than an unfalsifiable narrative.
+STEP 3 ─────────────────────────────────────────────────────────────
+  MULTI-VIEW NORMALIZATION
+  IN:  raw S1/S2/S3 records
+  DO:  build raw / normalized / transliterated / tokens / char n-grams /
+       phonetic / structured-address views for name + address
+  OUT: normalized_s1.parquet, normalized_s2.parquet, normalized_s3.parquet
+       (original columns preserved alongside new ones)
+──────────────────────────────────────────────────────────────────
 
----
+STEP 4 ─────────────────────────────────────────────────────────────
+  DYNAMIC COUNTRY SHARDING
+  IN:  normalized records
+  DO:  partition by country value (no hardcoded list) — India / US /
+       France / any future country auto-handled
+  OUT: per-country record shards, each processed independently downstream
+──────────────────────────────────────────────────────────────────
 
-## 5. Tech Stack
+STEP 5 ─────────────────────────────────────────────────────────────
+  RETRIEVAL CHANNEL 1 → 7 (run per country shard)
+  5a. Exact-name inverted index
+  5b. Token inverted index (common-token capped)
+  5c. Character n-gram / sparse TF-IDF retrieval
+  5d. Phonetic (Double Metaphone) index
+  5e. MinHash LSH near-duplicate blocking
+  5f. Sorted Neighborhood (sort key + sliding window)
+  5g. Address retrieval (postal / street-number / locality)
+  OUT: per-channel candidate lists + provenance flag per channel
+──────────────────────────────────────────────────────────────────
 
-| Layer                   | Tools                                                                                                                   | Notes                                                             |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| Data / normalization    | `pandas`, `polars` (large joins), `numpy`, `unidecode`, `ftfy`, `regex`                                                 | polars for the largest feature-table operations to control memory |
-| Address parsing         | `libpostal` (MIT)                                                                                                       | local, rule-based, no external calls                              |
-| Phonetic                | `jellyfish` (Double Metaphone)                                                                                          | typo-resilient blocking                                           |
-| Near-duplicate blocking | `datasketch` (MinHash LSH)                                                                                              | sub-linear, complements embeddings                                |
-| Embeddings              | `sentence-transformers` + `intfloat/multilingual-e5-base` or `BAAI/bge-m3` (verify exact license)                       | multilingual for transliteration + French                         |
-| ANN index               | `faiss-cpu`, **IVF-PQ** (quantized), not flat                                                                           | memory-bounded at 10M+ scale                                      |
-| Lexical similarity      | `rapidfuzz`                                                                                                             | vectorized, fast Levenshtein/Jaro-Winkler                         |
-| Baseline model          | `scikit-learn` LogisticRegression                                                                                       | leakage/label sanity check                                        |
-| Matcher                 | `LightGBM` (MIT)                                                                                                        | primary pairwise classifier                                       |
-| Calibration             | `scikit-learn` (Platt / isotonic)                                                                                       | fit on train split only                                           |
-| Local LLM (selective)   | `Qwen2.5-7B-Instruct` or `Phi-3-mini` (Apache-2.0 / MIT, verify exact license) via `llama.cpp` or `vLLM`, fully offline | capped call budget                                                |
-| Global consistency      | `pandas`/`polars` groupby-argmax                                                                                        | replaces infeasible Hungarian assignment                          |
-| Threshold tuning        | `Optuna`                                                                                                                | Macro F0.5 objective on validation                                |
-| Explainability          | `SHAP`                                                                                                                  | on final LightGBM model                                           |
-| Config                  | YAML per stage (`baseline.yaml`, `retrieval.yaml`, `matcher.yaml`, `final.yaml`)                                        | no hardcoded experimental params                                  |
-| Testing                 | `pytest`                                                                                                                | schema, normalization, retrieval, decision, output contract       |
-| Experiment tracking     | `MLflow` or structured JSON/CSV logs                                                                                    | reproducibility                                                   |
+STEP 6 ─────────────────────────────────────────────────────────────
+  CANDIDATE UNION + DEDUP
+  IN:  outputs of Steps 5a–5g
+  DO:  union all channels, dedup IDs, store which channel(s) hit,
+       store channel-count per pair
+  OUT: candidates_lexical.parquet
+──────────────────────────────────────────────────────────────────
 
----
+🚦 STEP 7 ─────────────────────────────────────────────────────────
+  CANDIDATE RECALL GATE #1 (lexical only)
+  DO:  compare candidates_lexical vs ground truth on val split
+  PASS IF: recall meets target (define target, e.g. ≥97%) across
+       country / 0-1-many / easy-medium-hard breakdowns
+  IF FAIL → go back to Step 5, add/tune channels. DO NOT CONTINUE.
+──────────────────────────────────────────────────────────────────
 
-## 6. Project Structure
+STEP 8 ─────────────────────────────────────────────────────────────
+  MULTILINGUAL EMBEDDING RETRIEVAL
+  IN:  normalized records (Step 3)
+  DO:  embed name / address / combined, build FAISS IVF-PQ index
+       (quantized, not flat), retrieve top-K per query
+  OUT: candidates_embedding.parquet
+──────────────────────────────────────────────────────────────────
 
-```
-dataset/
-    train/
-    test/
+🚦 STEP 9 ─────────────────────────────────────────────────────────
+  CANDIDATE RECALL GATE #2 (lexical + embedding)
+  DO:  union Step 6 + Step 8, re-measure recall
+  PASS IF: recall improves to target and P95 candidate count stays
+       within compute budget
+  IF FAIL → tune embedding K / index / add channels. DO NOT CONTINUE.
+──────────────────────────────────────────────────────────────────
 
-output/
-    matching_results.tsv
-    candidate_pairs.tsv
+STEP 10 ────────────────────────────────────────────────────────────
+  FREEZE CANDIDATE GENERATION
+  DO:  lock the exact config (channels, params, K) that passed Step 9
+  OUT: candidate_pairs.tsv generation code is now FROZEN — never
+       changed again, only re-run identically for test
+──────────────────────────────────────────────────────────────────
 
-notebooks/
-    01_eda.ipynb
+STEP 11 ────────────────────────────────────────────────────────────
+  CASCADE FEATURE ENGINE — L1 (cheap)
+  IN:  frozen candidate pairs
+  DO:  exact/normalized match flags, token overlap, channel count
+  OUT: pruned candidate set (drop obvious non-matches)
+──────────────────────────────────────────────────────────────────
 
-docs/
-    eda_report.md
-    methodology.md
-    experiments.md
-    error_analysis.md
+STEP 12 ────────────────────────────────────────────────────────────
+  CASCADE FEATURE ENGINE — L2 (expensive, survivors only)
+  DO:  edit distance, Jaro-Winkler, phonetic agreement, embedding
+       cosine, address component overlap, structural features
+  OUT: features.parquet (one row per surviving candidate pair)
+──────────────────────────────────────────────────────────────────
 
-code/
-    business_entity_resolution/
-        src/
-            data/          # loader.py, schema.py, validation.py
-            preprocessing/ # multi-view normalization
-            retrieval/      # exact, token, char, phonetic, LSH, SNM, address, embedding ANN
-            features/       # L1/L2 cascade feature engine
-            models/         # LR baseline, LightGBM, calibration
-            decision/       # 0/1/many entity decision engine, threshold/margin tuning
-            llm/            # selective local LLM re-ranker
-            evaluation/      # split.py, metrics.py (Macro F0.5), ablation harness
-            config.py
-            pipeline.py
-        tests/
-        configs/
-            baseline.yaml
-            retrieval.yaml
-            matcher.yaml
-            final.yaml
-        artifacts/          # cached embeddings, indexes, models
-        README.md
-        requirements.txt
+STEP 13 ────────────────────────────────────────────────────────────
+  LOGISTIC REGRESSION BASELINE
+  IN:  features.parquet (train split)
+  DO:  train, evaluate Macro F0.5 on val — sanity-checks features/labels
+  OUT: baseline_model.pkl, baseline metrics report
+──────────────────────────────────────────────────────────────────
 
-Documentation_template.md
+STEP 14 ────────────────────────────────────────────────────────────
+  HARD NEGATIVE MINING
+  IN:  train-split candidates + labels
+  DO:  mine near-miss non-matches (same name/address/country but not
+       a true match), respecting train/val boundary
+  OUT: augmented training set with hard negatives
+──────────────────────────────────────────────────────────────────
+
+STEP 15 ────────────────────────────────────────────────────────────
+  LIGHTGBM MATCHER
+  IN:  augmented training features
+  DO:  train, compare vs. LR baseline on val Macro F0.5
+  OUT: lightgbm_model.pkl (keep only if it beats baseline)
+──────────────────────────────────────────────────────────────────
+
+STEP 16 ────────────────────────────────────────────────────────────
+  PROBABILITY CALIBRATION
+  DO:  fit Platt + isotonic on train, compare calibration curves on val
+  OUT: calibrated_model.pkl
+──────────────────────────────────────────────────────────────────
+
+STEP 17 ────────────────────────────────────────────────────────────
+  ENTITY-LEVEL 0/1/MANY DECISION ENGINE
+  IN:  calibrated probabilities per candidate, grouped by S1
+  DO:  sort per S1, apply threshold + margin + evidence-strength rules,
+       explicitly branch: no-candidate / weak / one-strong / multi-strong
+  OUT: decision_engine.py
+──────────────────────────────────────────────────────────────────
+
+STEP 18 ────────────────────────────────────────────────────────────
+  F0.5 THRESHOLD / MARGIN OPTIMIZATION
+  IN:  decision engine + val set
+  DO:  grid/Optuna search over threshold + margin, optimize Macro F0.5
+  OUT: final_thresholds.yaml
+──────────────────────────────────────────────────────────────────
+
+STEP 19 ────────────────────────────────────────────────────────────
+  GLOBAL CONSISTENCY (groupby-argmax) — VALIDATION-GATED
+  DO:  for candidate IDs claimed by >1 S1, keep only top-scoring
+       assignment above threshold; measure Macro F0.5 with vs. without
+  OUT: keep ONLY if it improves val Macro F0.5
+──────────────────────────────────────────────────────────────────
+
+STEP 20 ────────────────────────────────────────────────────────────
+  SELECTIVE LOCAL LLM — VALIDATION-GATED, BUDGET-CAPPED
+  DO:  identify decision-changing ambiguous S1 entities only, cap total
+       LLM calls (e.g. ≤50K), run local Qwen2.5-7B/Phi-3-mini, measure
+       Macro F0.5 with vs. without
+  OUT: keep ONLY if it improves val Macro F0.5, else remove entirely
+──────────────────────────────────────────────────────────────────
+
+STEP 21 ────────────────────────────────────────────────────────────
+  FRANCE / UNSEEN-COUNTRY ROBUSTNESS EVAL
+  DO:  score India / US / France separately on val (simulate via
+       held-out-country test), report gaps, patch normalization/
+       retrieval if France underperforms
+  OUT: docs/error_analysis.md (country section)
+──────────────────────────────────────────────────────────────────
+
+STEP 22 ────────────────────────────────────────────────────────────
+  ERROR ANALYSIS + ABLATION + SHAP
+  DO:  bucket failures, run A0→A12 ablation table, generate SHAP on
+       final matcher
+  OUT: docs/experiments.md, docs/error_analysis.md
+──────────────────────────────────────────────────────────────────
+
+STEP 23 ────────────────────────────────────────────────────────────
+  FULL TEST INFERENCE (frozen pipeline, no ground truth touched)
+  IN:  dataset/test/*
+  DO:  run Steps 3→20 exactly as frozen, over full test set
+  OUT: raw predictions
+──────────────────────────────────────────────────────────────────
+
+STEP 24 ────────────────────────────────────────────────────────────
+  GENERATE OUTPUT FILES
+  OUT: output/matching_results.tsv, output/candidate_pairs.tsv
+──────────────────────────────────────────────────────────────────
+
+🚦 STEP 25 ─────────────────────────────────────────────────────────
+  VALIDATE + ASSERT
+  DO:  run utils/validate_submission.py → must PASS
+       assert FINAL_MATCHES ⊆ CANDIDATES
+  IF FAIL → fix output generation. DO NOT SUBMIT.
+──────────────────────────────────────────────────────────────────
+
+STEP 26 ────────────────────────────────────────────────────────────
+  DOCUMENTATION + SUBMISSION ZIP
+  OUT: README.md, methodology.md, experiments.md, error_analysis.md,
+       <team_name>_submission.zip
+──────────────────────────────────────────────────────────────────
 ```
 
 ---
 
-## 7. Implementation Order (do not skip or reorder)
+## PART 2 — TEAM EXECUTION PLAN
 
-1. Freeze data contract (schema, ID uniqueness, missingness, ground-truth validity)
-2. Leakage-safe S1-level train/validation split (fixed seed)
-3. Multi-view normalization (name + address, all views, deterministic and tested)
-4. Dynamic country sharding (no hardcoded country list)
-5. Exact-name retrieval → measure
-6. Token retrieval → measure
-7. Character retrieval → measure
-8. Phonetic retrieval → measure
-9. MinHash LSH retrieval → measure
-10. Sorted Neighborhood retrieval → measure
-11. Address retrieval → measure
-12. Candidate union + provenance
-13. **Candidate recall gate #1** (lexical channels only) — stop and fix if weak
-14. Multilingual embedding ANN retrieval (IVF-PQ)
-15. **Candidate recall gate #2** (with embeddings) — stop and fix if weak
-16. **Freeze candidate generation** — this exact config produces `candidate_pairs.tsv`
-17. Cascade pairwise feature engine (L1 prune → L2 full features)
-18. Logistic regression baseline (sanity check, Macro F0.5)
-19. Hard negative mining (train split only)
-20. LightGBM matcher (compare vs. LR on Macro F0.5)
-21. Probability calibration (Platt vs. isotonic, train-fit only)
-22. Entity-level 0/1/many decision engine
-23. F0.5 threshold + margin optimization (validation only, documented)
-24. Global consistency via groupby-argmax — validation-gated
-25. Selective local LLM re-ranker — validation-gated, budget-capped
-26. France / unseen-country robustness evaluation
-27. Error analysis (bucketed failure modes with root cause + examples)
-28. Ablation study (A0 baseline → A12 full system, each component measured)
-29. SHAP / feature importance on final matcher
-30. Full frozen-pipeline test inference (no ground truth, no external lookup, no hand-tuning to test)
-31. Generate `matching_results.tsv`
-32. Generate `candidate_pairs.tsv`
-33. Run official validator (`utils/validate_submission.py`) — must PASS
-34. Internal assertion: `FINAL_MATCHES ⊆ CANDIDATES`
-35. Run full test suite
-36. Write `docs/methodology.md`, `docs/experiments.md`, `docs/error_analysis.md`
-37. Prepare final submission ZIP
+### Suggested team structure (4–5 people)
 
----
+| Role                                                               | Owns pipeline steps    | Primary skills                                        |
+| ------------------------------------------------------------------ | ---------------------- | ----------------------------------------------------- |
+| **A. Data & Infra Lead**                                           | 0, 1, 2, 4, 10, 25, 26 | data engineering, validation, packaging, repo hygiene |
+| **B. Retrieval Engineer**                                          | 3, 5a–5g, 6, 7, 8, 9   | search/blocking, FAISS, LSH, scalability              |
+| **C. ML Modeling Engineer**                                        | 11, 12, 13, 14, 15, 16 | feature engineering, LightGBM, calibration            |
+| **D. Decision & Evaluation Lead**                                  | 17, 18, 19, 21, 22     | metrics, threshold tuning, error analysis, ablations  |
+| **E. LLM & Docs Lead** (can double with A or D on a 4-person team) | 20, 23, 24, 26         | local LLM serving, prompt design, methodology writing |
 
-## 8. Engineering Rules (non-negotiable)
+If only 4 people: merge **E into D** (Decision/Eval lead also owns the selective LLM, since it plugs directly into the decision engine) and have **A** own final inference + packaging with help from whoever is free.
 
-- No all-pairs comparison, anywhere, at any stage.
-- No Hungarian / O(n³) assignment at this scale — global consistency uses groupby-argmax.
-- Process per country shard to bound memory; never load all three sources fully joined at once.
-- Cache: normalized fields, embeddings, ANN indexes, candidate sets, trained models — all resumable.
-- Fit TF-IDF, vocabularies, calibration, and thresholds **only on the training split**. Validation is for tuning/evaluation; test is inference-only.
-- `candidate_pairs.tsv` must be the _exact_ frozen candidate set fed to the matcher — never regenerate a different one for final inference.
-- Any model (LightGBM, embedding model, LLM) must have its **exact model license** verified as MIT/Apache-2.0 and ≤8B params — do not infer this from the library's license.
-- If a component doesn't improve validation Macro F0.5, remove it — do not keep it for appearances.
+### Critical path (cannot be parallelized — hard dependencies)
 
----
+```
+Step 1 → Step 2 → Step 3 → Step 4 → Steps 5–9 (🚦 gates) → Step 10 (FREEZE)
+   → Step 11–12 → Step 13 → Step 15 → Step 16 → Step 17 → Step 18
+   → Step 19 → Step 20 → Step 23 → Step 24 → 🚦 Step 25 → Step 26
+```
 
-## 9. Definition of Done
+Everything downstream of Step 10 depends on the frozen candidate set. Everything downstream of Step 16 depends on the calibrated model. **These two freezes are your synchronization points — plan team check-ins around them, not around calendar days.**
 
-- [ ] Dataset contract validated; original files untouched
-- [ ] Leakage-safe S1-level validation split
-- [ ] Multi-view normalization (name + address) implemented and tested
-- [ ] Dynamic country sharding (no hardcoded countries)
-- [ ] All retrieval channels implemented: exact, token, character, phonetic, MinHash LSH, Sorted Neighborhood, address, embedding ANN
-- [ ] Candidate union + provenance stored
-- [ ] Candidate recall measured and gated (pre- and post-embedding)
-- [ ] Candidate generation frozen before matcher training
-- [ ] Cascade (L1/L2) pairwise feature engine
-- [ ] Logistic regression baseline evaluated
-- [ ] Hard negative mining implemented
-- [ ] LightGBM matcher trained and compared against baseline
-- [ ] Calibration evaluated (Platt vs. isotonic)
-- [ ] 0/1/many entity decision engine implemented (no top-1 forcing)
-- [ ] Macro F0.5 threshold/margin optimization completed on validation
-- [ ] Global consistency (groupby-argmax) implemented and validation-gated
-- [ ] Selective local LLM implemented, budget-capped, validation-gated (kept only if it helps)
-- [ ] France evaluated separately from India/US
-- [ ] Error analysis completed with bucketed failure modes
-- [ ] Full ablation study (A0–A12) completed
-- [ ] SHAP / feature importance generated
-- [ ] Full test inference run on frozen pipeline
-- [ ] `matching_results.tsv` and `candidate_pairs.tsv` generated
-- [ ] `FINAL_MATCHES ⊆ CANDIDATES` verified
-- [ ] Official validator PASS
-- [ ] All tests PASS
-- [ ] `README.md`, `docs/methodology.md`, `docs/experiments.md`, `docs/error_analysis.md` completed
-- [ ] Final submission ZIP assembled
+### What CAN run in parallel
+
+- **Steps 1–2** (Data/Infra) run alongside early **Step 3 prototyping** (Retrieval) on a small sample, since normalization logic can be drafted before the split is finalized.
+- **Steps 5a–5g** (the seven retrieval channels) are largely independent of each other — split across 2 people if available (e.g., B1 does exact/token/character, B2 does phonetic/LSH/SNM/address), then merge at Step 6.
+- While Retrieval is working through Steps 5–9, **ML Modeling (C)** can build and unit-test the feature engine (Step 11–12) and LightGBM training code (Step 15) against a _toy/sample candidate set_, so it's ready to run for real the moment Step 10 freezes.
+- **Decision & Eval (D)** can build the Macro F0.5 metric implementation and the decision-engine skeleton (Step 17–18) early, independent of retrieval/matching progress, and test it with synthetic scores.
+- **Docs (E/A)** can draft `docs/eda_report.md` and the methodology template skeleton from day one, filling in numbers as each stage completes, rather than writing everything at the end.
+- Ablations (Step 22) can be run incrementally as each component lands, rather than as one block at the end.
+
+### Suggested timeline (example: 6-day sprint — adjust to your actual deadline)
+
+| Day       | Focus                                                                                                                    | Milestone                                                                      |
+| --------- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
+| **Day 1** | Steps 0–4: data contract, split, normalization, country sharding                                                         | Normalized, sharded data ready for all downstream work                         |
+| **Day 2** | Steps 5–7: build all lexical retrieval channels, union, Gate #1                                                          | 🚦 Lexical candidate recall gate passes                                        |
+| **Day 3** | Steps 8–10: embedding retrieval, Gate #2, freeze candidates                                                              | 🚦 Candidate generation frozen — **hard sync point, whole team reviews**       |
+| **Day 4** | Steps 11–16: features, baseline, hard negatives, LightGBM, calibration                                                   | Calibrated matcher beats baseline on val Macro F0.5                            |
+| **Day 5** | Steps 17–22: decision engine, threshold tuning, global consistency, selective LLM, France eval, error analysis/ablations | Final validation Macro F0.5 locked in; methodology draft complete              |
+| **Day 6** | Steps 23–26: full test inference, output generation, validator, docs, ZIP                                                | 🚦 Validator PASS, submission ready with time to spare for a leaderboard check |
+
+Build in slack: submit a rough end-to-end run (even with weak components) by end of **Day 3**, so you have a working submission before you start optimizing. This protects you from a broken pipeline the night before the deadline.
+
+### Team workflow rules
+
+1. **One shared repo, feature branches per pipeline stage**, PR review before merging into `main` — especially around the two freeze points (candidate generation, calibrated model), since everyone downstream depends on them being stable.
+2. **Config-driven handoffs**: nobody hardcodes parameters in their module — every tunable value lives in the relevant `configs/*.yaml`, so another teammate can adjust it without touching code.
+3. **Daily 15-minute sync** focused on exactly three questions: _what's blocking me, what did my last gate/metric show, what do I need from someone else's output._
+4. **No one touches test data until Step 23.** All development, tuning, and debugging happens against train/validation only — enforce this as a hard team rule, not just a design note.
+5. **Whoever hits a 🚦 gate posts the numbers to the team** (recall %, Macro F0.5, breakdown by country/difficulty) before anyone proceeds — gates are team checkpoints, not solo sign-offs.
+6. **Methodology doc is written incrementally**, one section per completed stage, by whoever owns that stage — not reconstructed from memory at the end.
+7. **If a component doesn't beat its baseline on validation Macro F0.5, cut it** — no one keeps a personally-built component "because it took effort." Decisions are validation-driven, not sentiment-driven.
