@@ -1,1 +1,39 @@
+# Datasets
 dataset/
+
+# Artifacts and outputs
+artifacts/
+output/
+code/business_entity_resolution/artifacts/
+code/business_entity_resolution/output/
+code/business_entity_resolution/data/
+.tmp/
+code/business_entity_resolution/.tmp/
+
+# Temp test files
+*.tsv
+*.csv
+*.parquet
+*.pkl
+*.model
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env/
+.venv/
+.pytest_cache/
+
+# OS files
+.DS_Store
+*.DS_Store
+**/.DS_Store
+
+# IDE
+.idea/
+.vscode/
